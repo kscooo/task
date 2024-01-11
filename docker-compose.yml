@@ -1,0 +1,54 @@
+version: "3"
+services:
+  app:
+    container_name: task_app
+    build:
+      context: .
+      dockerfile: Dockerfile-app
+    ports:
+      - "8080:8080"
+    depends_on:
+      - task-postgres
+      - task-ganache
+    networks:
+      - task_net
+
+
+  task-postgres:
+    image: postgres:latest
+    container_name: task_db_postgres
+    environment:
+      - POSTGRES_USER=gorm
+      - POSTGRES_PASSWORD=gorm
+      - POSTGRES_DB=gorm
+    ports:
+      - "5432:5432"
+    volumes:
+      - ~/apps/postgres:/var/lib/postgresql/data
+    networks:
+      - task_net
+
+  task-ganache:
+    build:
+      context: .
+      dockerfile: Dockerfile-ganache
+      args:
+        - NODE_VERSION=hydrogen
+        - GANACHE_VERSION=7.9.1
+        - PRIV_KEY=0xe5127005b33e35e669aec6f463adc2c1eac00710bdfc299e0c0f46f786c5197a
+        - INIT_WEI=1000000000000000000000
+    ports:
+      - "8545:8545"
+      - "8546:8546"
+    expose:
+      - 8545
+      - 8546
+    volumes:
+        - ~/apps/ganache:/var/lib/ganache
+    networks:
+      - task_net
+
+
+networks:
+  task_net:
+    driver: bridge

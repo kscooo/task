@@ -1,0 +1,45 @@
+# curl -X POST http://localhost:8545 --data '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":83}'
+POST http://localhost:8545
+Content-Type: application/json
+
+{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":83}
+
+###
+
+POST http://localhost:8545
+Content-Type: application/json
+
+{
+  "jsonrpc":"2.0",
+  "method":"eth_getBalance",
+  "params":["0xBF5e18bCdA7e9189B92EF17a5dd7E7e4767dBc36","latest"],
+  "id":1
+}
+
+###
+POST http://localhost:8080/withdrawal/execute/4
+Content-Type: application/json
+
+{}
+
+###
+POST http://localhost:8080/withdrawal/approve/4
+Content-Type: application/json
+
+{
+  "manager_id": 2
+}
+
+###
+GET http://localhost:8080/withdrawal/status/0
+Accept: application/json
+
+###
+POST http://localhost:8080/withdrawal/create
+Content-Type: application/json
+
+{
+  "amount": "1"
+}
+
+
