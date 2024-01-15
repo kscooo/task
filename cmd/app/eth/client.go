@@ -44,21 +44,24 @@ func (c *Client) SendTransaction(amount decimal.Decimal) (ethgo.Hash, error) {
 		Value:    new(big.Int).SetUint64(1),
 	})
 	if err != nil {
-		log.Fatalf("estimate gas failed: err=%v", err)
+		log.Printf("estimate gas failed: err=%v", err)
+		return ethgo.Hash{}, err
 	}
 	log.Printf("gas=%d", gas)
 
 	// 获取 nonce
 	nonce, err := c.GetNonce(fromAddr, ethgo.Latest)
 	if err != nil {
-		log.Fatalf("get nonce failed: err=%v", err)
+		log.Printf("get nonce failed: err=%v", err)
+		return ethgo.Hash{}, err
 	}
 	log.Printf("nonce=%d", nonce)
 
 	// 获取 chainID
 	chainID, err := c.ChainID()
 	if err != nil {
-		log.Fatalf("get chain id failed: err=%v", err)
+		log.Printf("get chain id failed: err=%v", err)
+		return ethgo.Hash{}, err
 	}
 	log.Printf("chainID=%d", chainID)
 
@@ -78,20 +81,30 @@ func (c *Client) SendTransaction(amount decimal.Decimal) (ethgo.Hash, error) {
 	// 构造签名
 	key, err := wallet.NewWalletFromPrivKey(convertPrivateKey(FromPrivateKeys))
 	if err != nil {
-		log.Fatalf("new wallet from private key failed: err=%v", err)
+		log.Printf("new wallet from private key failed: err=%v", err)
+		return ethgo.Hash{}, err
 	}
 
 	// 签名
 	signer := wallet.NewEIP155Signer(chainID.Uint64())
 	signedTxn, err := signer.SignTx(txn, key)
+	if err != nil {
+		log.Printf("sign transaction failed: err=%v", err)
+		return ethgo.Hash{}, err
+	}
 
 	// 编码
 	txnRaw, err := signedTxn.MarshalRLPTo(nil)
+	if err != nil {
+		log.Printf("marshal rlp failed: err=%v", err)
+		return ethgo.Hash{}, err
+	}
 
 	// 发送交易
 	hash, err := c.SendRawTransaction(txnRaw)
 	if err != nil {
-		log.Fatalf("send raw transaction failed: err=%v", err)
+		log.Printf("send raw transaction failed: err=%v", err)
+		return ethgo.Hash{}, err
 	}
 	log.Printf("hash=%s", hash.String())
 
