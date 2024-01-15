@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"net/http"
+	"time"
 
 	"task/cmd/app/eth"
 	"task/cmd/app/model"
@@ -10,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/shopspring/decimal"
 	"github.com/umbracle/ethgo"
+	"gorm.io/gorm"
 )
 
 type WithdrawalRequest struct {
@@ -18,6 +20,163 @@ type WithdrawalRequest struct {
 
 type WithdrawalApproveRequest struct {
 	ManagerID uint64 `json:"manager_id"`
+}
+
+// TransactionState 交易状态
+type TransactionState uint8
+
+const (
+	StateUnchained TransactionState = iota // 未上链
+	StatePending                           // 上链中
+	StateSuccess                           // 上链成功
+	StateFailure                           // 上链失败
+	StateException                         // 其他异常情况
+)
+
+// TransactionEvent 触发状态转换的事件
+type TransactionEvent uint8
+
+const (
+	EventStart             TransactionEvent = iota // 开始处理
+	EventCheck                                     // 检查状态
+	EventRetry                                     // 重试事件
+	EventMaxRetriesReached                         // 达到最大重试次数
+	EventSuccess                                   // 上链成功
+)
+
+type StateMachine struct {
+	state         TransactionState
+	retries       int
+	maxRetries    int
+	retryInterval time.Duration
+	withdrawal    *model.Withdrawal
+	client        *eth.Client
+	tx            *gorm.DB
+}
+
+func NewStateMachine(
+	withdrawal *model.Withdrawal,
+	client *eth.Client,
+	tx *gorm.DB,
+) *StateMachine {
+	return &StateMachine{
+		state:         StateUnchained,
+		retries:       0,
+		maxRetries:    3,
+		retryInterval: time.Second * 1,
+		withdrawal:    withdrawal,
+		client:        client,
+		tx:            tx,
+	}
+}
+
+func (sm *StateMachine) Execute() {
+	sm.next(EventStart)
+}
+
+// 如果没有 tx hash，则是未上链，则发起上链请求，并保存 tx hash
+// 根据 tx hash 查询 receipt，根据 receipt 状态更新提款申请状态
+// 总重试的次数为 3 次，每次间隔 1s
+//	  a) 如果获取不到 receipt，说明上链中，更新提款申请状态为上链中，间隔 1s 重新查询 receipt。
+//       重试，receipt 仍然获取不到，则打印日志，状态为上链中。
+//	  b) 如果 receipt 状态为成功, 则更新提款申请状态为上链成功。
+//	  c) 如果 receipt 状态为失败, 打印日志，间隔 1s 重新发起上链请求。
+//	     重试，receipt 仍然失败，则打印日志，状态为上链失败。
+//    d) 如果 receipt 状态为其他异常情况，打印日志，间隔 1s 重新发起上链请求。
+//	     重试，receipt 仍然失败，则打印日志，状态为其他异常情况。
+// 流程图：img.png
+func (sm *StateMachine) next(event TransactionEvent) {
+	switch event {
+	case EventStart:
+		// 发起上链请求，失败则重试
+		hash, err := sm.client.SendTransaction(sm.withdrawal.Amount)
+		if err != nil {
+			log.Printf("send transaction failed: err=%v", err)
+			sm.state = StateUnchained
+			sm.next(EventRetry)
+			return
+		}
+
+		sm.state = StatePending
+		sm.saveHashAndStatus(hash.String(), model.StatePending)
+		sm.next(EventCheck)
+	case EventCheck:
+		// 查询 receipt
+		receipt, err := sm.client.GetTransactionReceipt(ethgo.HexToHash(sm.withdrawal.TxHash))
+		if err != nil {
+			log.Printf("get transaction receipt failed: err=%v", err)
+			sm.state = StatePending
+			sm.next(EventRetry)
+			return
+		}
+		// mock pending
+		// receipt = nil
+		if receipt == nil {
+			sm.state = StatePending
+			sm.next(EventRetry)
+			return
+		}
+
+		// mock failure
+		// receipt.Status = 0
+		// mock exception
+		// receipt.Status = 2
+
+		if receipt.Status == 1 {
+			sm.state = StateSuccess
+			sm.updateWithdrawalStatus(model.StateSuccess)
+			sm.next(EventSuccess)
+		} else if receipt.Status == 0 {
+			sm.state = StateFailure
+			sm.updateWithdrawalStatus(model.StateFailure)
+			sm.next(EventRetry)
+		} else {
+			sm.state = StateException
+			sm.updateWithdrawalStatus(model.StateException)
+			sm.next(EventRetry)
+		}
+	case EventRetry:
+		if sm.retries >= sm.maxRetries {
+			sm.next(EventMaxRetriesReached)
+			return
+		}
+		sm.retries++
+		time.Sleep(sm.retryInterval)
+		// 重试，根据状态跳转
+		if sm.state == StatePending {
+			sm.next(EventCheck)
+		} else {
+			sm.next(EventStart)
+		}
+	case EventMaxRetriesReached:
+		log.Printf("max retries reached: retries=%d, state=%d", sm.retries, sm.state)
+		if sm.state == StateUnchained {
+			sm.updateWithdrawalStatus(model.StateException)
+		}
+	case EventSuccess:
+		log.Printf("success: retries=%d, state=%d", sm.retries, sm.state)
+	default:
+		log.Printf("invalid event: event=%d", event)
+	}
+}
+
+func (sm *StateMachine) updateWithdrawalStatus(status model.WithdrawalState) {
+	sm.withdrawal.Status = uint64(status)
+	err := sm.tx.Save(sm.withdrawal).Error
+	if err != nil {
+		log.Printf("update withdrawal status failed: err=%v", err)
+		return
+	}
+}
+
+func (sm *StateMachine) saveHashAndStatus(hash string, status model.WithdrawalState) {
+	sm.withdrawal.TxHash = hash
+	sm.withdrawal.Status = uint64(status)
+	err := sm.tx.Save(sm.withdrawal).Error
+	if err != nil {
+		log.Printf("update withdrawal tx hash and status failed: err=%v", err)
+		return
+	}
 }
 
 func main() {
@@ -175,14 +334,19 @@ func main() {
 			return
 		}
 
+		// 达到两个时自动执行提款
+		// 开启事务，事务隔离级别为最高档 serializable
+		tx := db.Begin()
+
 		// 插入审批记录
 		withdrawalConfirmation := &model.WithdrawalConfirmation{
 			WithdrawalID: uint64(withdrawal.ID),
 			ManagerID:    mangerID,
 		}
 
-		err = db.Create(withdrawalConfirmation).Error
+		err = tx.Create(withdrawalConfirmation).Error
 		if err != nil {
+			tx.Rollback()
 			log.Printf("create withdrawal confirmation failed: err=%v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{
 				"message": "create withdrawal confirmation failed",
@@ -190,9 +354,73 @@ func main() {
 			return
 		}
 
+		// 查询是否有俩个以上的审批记录
+		var count int64
+		err = tx.Model(&model.WithdrawalConfirmation{}).
+			Where("withdrawal_id = ?", withdrawal.ID).
+			Count(&count).
+			Error
+		if err != nil {
+			tx.Rollback()
+			log.Printf("count withdrawal confirmation failed: err=%v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"message": "count withdrawal confirmation failed",
+			})
+			return
+		}
+
+		// 少于两个审批记录，直接返回
+		if count < 2 {
+			tx.Commit()
+			c.JSON(http.StatusOK, gin.H{
+				"message": "success",
+			})
+			return
+		}
+
+		// 两个以上的审批记录，自动执行提款
+		// 封装状态机，自动执行提款流程
+		// 如果有 tx hash，则不做任何操作，直接返回。
+		err = tx.Where("id = ?", requestID).First(&withdrawal).Error
+		if err != nil {
+			tx.Rollback()
+			log.Printf("find withdrawal failed: err=%v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"message": "find withdrawal failed",
+			})
+			return
+		}
+
+		// 检查状态是否符合预期
+		if withdrawal.TxHash != "" {
+			if withdrawal.Status != 0 {
+				log.Printf("invalid status: status=%d", withdrawal.Status)
+			}
+			tx.Commit()
+			c.JSON(http.StatusOK, gin.H{
+				"message": "success",
+			})
+			return
+		}
+
+		if !(withdrawal.TxHash == "" && withdrawal.Status == 0) {
+			log.Printf("invalid status: tx_hash=%s, status=%d", withdrawal.TxHash, withdrawal.Status)
+			tx.Commit()
+			c.JSON(http.StatusOK, gin.H{
+				"message": "success",
+			})
+			return
+		}
+
+		// 执行提款
+		sm := NewStateMachine(&withdrawal, client, tx)
+		sm.Execute()
+
+		tx.Commit()
 		c.JSON(http.StatusOK, gin.H{
 			"message": "success",
 		})
+
 	})
 
 	// 执行提款 (POST /withdrawal/execute/{request_id})
@@ -242,11 +470,12 @@ func main() {
 			return
 		}
 
+		// 少于两个审批记录，不允许提款
 		if count < 2 {
 			tx.Rollback()
 			log.Printf("invalid request: count=%d", count)
 			c.JSON(http.StatusBadRequest, gin.H{
-				"message": "invalid request",
+				"message": "manager count less than 2",
 			})
 			return
 		}
@@ -319,6 +548,14 @@ func main() {
 			withdrawal.TxHash = ""
 			withdrawal.Status = 0
 			err = tx.Save(&withdrawal).Error
+			if err != nil {
+				tx.Rollback()
+				log.Printf("update withdrawal status failed: err=%v", err)
+				c.JSON(http.StatusInternalServerError, gin.H{
+					"message": "update withdrawal status failed",
+				})
+				return
+			}
 			tx.Commit()
 
 			c.JSON(http.StatusOK, gin.H{
@@ -327,7 +564,7 @@ func main() {
 			return
 		}
 
-		// 1) 如果没有 tx hash/或者是上链失败，则（重新）发起上链请求，并保存 tx hash，根据 tx hash 查询 receipt
+		// 1) 如果没有 tx hash/上链失败，则（重新）发起上链请求，并保存 tx hash，根据 tx hash 查询 receipt
 		//	  a) 如果获取不到 receipt，说明上链中，不做任何操作，更新提款申请状态为上链中
 		//	  b) 如果 receipt 状态为成功, 则更新提款申请状态为上链成功
 		//	  c) 如果 receipt 状态为失败, 则更新提款申请状态为上链失败
